@@ -1524,10 +1524,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             c2 = ch[f[-1]]
         elif isinstance(m, str):
             t = m
-            if len(args) == 2:        
-                m = timm.create_model(m, pretrained=args[0], pretrained_cfg_overlay={'file':args[1]}, features_only=True)
-            elif len(args) == 1:
-                m = timm.create_model(m, pretrained=args[0], features_only=True)
+            m = timm.create_model(m, pretrained=args[0], features_only=True)
             c2 = m.feature_info.channels()
         elif m in {starnet_s050, starnet_s100, starnet_s150, starnet_s1, starnet_s2, starnet_s3, starnet_s4}:
             m = m(*args)
@@ -1553,7 +1550,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         m.np = sum(x.numel() for x in m_.parameters())  # number params
         m_.i, m_.f, m_.type = i + 4 if is_backbone else i, f, t  # attach index, 'from' index, type
         if verbose:
-            LOGGER.info(f'{i:>3}{str(f):>20}{n_:>3}{m.np:10.0f}  {t:<45}{str(args):<30}')  # print
+            LOGGER.info(f'{i:>3}{str(f):>20}{n_:>3}{m.np:10.0f}  {t:<60}{str(args):<30}')  # print
         save.extend(x % (i + 4 if is_backbone else i) for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
