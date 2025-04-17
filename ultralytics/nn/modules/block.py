@@ -21,6 +21,9 @@ __all__ = (
     "C3",
     "C2f",
     "C2fAttn",
+    "C2f_Star",
+    "C2f_Star_EMA",
+    "C2f_STAR_CAA",
     "ImagePoolingAttn",
     "ContrastiveHead",
     "BNContrastiveHead",
@@ -1964,3 +1967,130 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+# TSTAR-MODIFICATION
+######################################## C2f-Star begin ########################################
+from timm.models.layers import DropPath
+
+class ConvBN(torch.nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size=1, stride=1, padding=0, dilation=1, groups=1, with_bn=True):
+        super().__init__()
+        self.add_module('conv', torch.nn.Conv2d(in_planes, out_planes, kernel_size, stride, padding, dilation, groups))
+        if with_bn:
+            self.add_module('bn', torch.nn.BatchNorm2d(out_planes))
+            torch.nn.init.constant_(self.bn.weight, 1)
+            torch.nn.init.constant_(self.bn.bias, 0)
+
+# CVPR2024 PKINet
+class CAA(nn.Module):
+    def __init__(self, ch, h_kernel_size = 11, v_kernel_size = 11) -> None:
+        super().__init__()
+        
+        self.avg_pool = nn.AvgPool2d(7, 1, 3)
+        self.conv1 = Conv(ch, ch)
+        self.h_conv = nn.Conv2d(ch, ch, (1, h_kernel_size), 1, (0, h_kernel_size // 2), 1, ch)
+        self.v_conv = nn.Conv2d(ch, ch, (v_kernel_size, 1), 1, (v_kernel_size // 2, 0), 1, ch)
+        self.conv2 = Conv(ch, ch)
+        self.act = nn.Sigmoid()
+    
+    def forward(self, x):
+        attn_factor = self.act(self.conv2(self.v_conv(self.h_conv(self.conv1(self.avg_pool(x))))))
+        return attn_factor * x
+
+
+class EMA(nn.Module):
+    def __init__(self, channels, factor=8):
+        super(EMA, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv3x3 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)  # b*g,c//g,h,w
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(group_x)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)
+
+
+class StarNetBlock(nn.Module):
+    def __init__(self, dim, mlp_ratio=3, drop_path=0.):
+        super().__init__()
+        self.dwconv = ConvBN(dim, dim, 7, 1, (7 - 1) // 2, groups=dim, with_bn=True)
+        self.f1 = ConvBN(dim, mlp_ratio * dim, 1, with_bn=False)
+        self.f2 = ConvBN(dim, mlp_ratio * dim, 1, with_bn=False)
+        self.g = ConvBN(mlp_ratio * dim, dim, 1, with_bn=True)
+        self.dwconv2 = ConvBN(dim, dim, 7, 1, (7 - 1) // 2, groups=dim, with_bn=False)
+        self.act = nn.ReLU6()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x1, x2 = self.f1(x), self.f2(x)
+        x = self.act(x1) * x2
+        x = self.dwconv2(self.g(x))
+        return input + self.drop_path(x)
+
+
+class Star_Block_EMA(StarNetBlock):
+    def __init__(self, dim, mlp_ratio=3, drop_path=0):
+        super().__init__(dim, mlp_ratio, drop_path)
+        self.attention = EMA(mlp_ratio * dim)
+    
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x1, x2 = self.f1(x), self.f2(x)
+        x = self.act(x1) * x2
+        x = self.dwconv2(self.g(self.attention(x)))
+        x = input + self.drop_path(x)
+        return x
+
+class Star_Block_CAA(StarNetBlock):
+    def __init__(self, dim, mlp_ratio=3, drop_path=0):
+        super().__init__(dim, mlp_ratio, drop_path)
+        
+        self.attention = CAA(mlp_ratio * dim)
+    
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x1, x2 = self.f1(x), self.f2(x)
+        x = self.act(x1) * x2
+        x = self.dwconv2(self.g(self.attention(x)))
+        x = input + self.drop_path(x)
+        return x
+
+class C2f_Star(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(StarNetBlock(self.c) for _ in range(n))
+
+class C2f_Star_EMA(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(Star_Block_EMA(self.c) for _ in range(n))
+
+class C2f_Star_CAA(C2f):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(Star_Block_CAA(self.c) for _ in range(n))
+
+######################################## C2f-Star end ########################################
+

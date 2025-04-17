@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+import timm
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -31,6 +32,9 @@ from ultralytics.nn.modules import (
     BottleneckCSP,
     C2f,
     C2fAttn,
+    C2f_Star,
+    C2f_Star_CAA,
+    C2f_Star_EMA,
     C2fCIB,
     C2fPSA,
     C3Ghost,
@@ -44,6 +48,9 @@ from ultralytics.nn.modules import (
     Conv2,
     ConvTranspose,
     Detect,
+    Detect_TADDH,
+    Detect_LADH,
+    Detect_LSCD,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -69,6 +76,8 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     v10Detect,
 )
+from ultralytics.nn.modules.starnet import *
+from ultralytics.nn.modules.block import CAA, EMA
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -156,8 +165,22 @@ class BaseModel(torch.nn.Module):
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
+            if hasattr(m, 'backbone'):
+                x = m(x)
+                for _ in range(5 - len(x)):
+                    x.insert(0, None)
+                for i_idx, i in enumerate(x):
+                    if i_idx in self.save:
+                        y.append(i)
+                    else:
+                        y.append(None)
+                # for i in x:
+                #     if i is not None:
+                #         print(i.size())
+                x = x[-1]
+            else:
+                x = m(x)  # run
+                y.append(x if m.i in self.save else None)  # save output
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
             if embed and m.i in embed:
@@ -262,7 +285,7 @@ class BaseModel(torch.nn.Module):
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
         if isinstance(
-            m, Detect
+            m, (Detect, Detect_LADH, Detect_LSCD, Detect_TADDH)
         ):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect, YOLOESegment
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
@@ -337,8 +360,8 @@ class DetectionModel(BaseModel):
 
         # Build strides
         m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 256  # 2x min stride
+        if isinstance(m, (Detect, Detect_LADH, Detect_LSCD, Detect_TADDH)):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+            s = 256  # 2x min stride TSTAR-MODIFICATION
             m.inplace = self.inplace
 
             def _forward(x):
@@ -1272,6 +1295,11 @@ def attempt_load_weights(weights, device=None, inplace=True, fuse=False):
     for m in ensemble.modules():
         if hasattr(m, "inplace"):
             m.inplace = inplace
+
+        # t = type(m)
+        # if t in (nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU, Detect, Detect_LSCD, Detect_TADDH, Detect_LADH):
+        #     m.inplace = inplace
+        
         elif isinstance(m, torch.nn.Upsample) and not hasattr(m, "recompute_scale_factor"):
             m.recompute_scale_factor = None  # torch 1.11.0 compatibility
 
@@ -1360,6 +1388,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+
+    is_backbone = False
+
     base_modules = frozenset(
         {
             Classify,
@@ -1378,6 +1409,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C1,
             C2,
             C2f,
+            C2f_Star,
+            C2f_Star_EMA,
+            C2f_Star_CAA,
             C3k2,
             RepNCSPELAN4,
             ELAN1,
@@ -1404,6 +1438,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C1,
             C2,
             C2f,
+            C2f_Star,
+            C2f_Star_EMA,
+            C2f_Star_CAA,
             C3k2,
             C2fAttn,
             C3,
@@ -1425,6 +1462,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             if "torchvision.ops." in m
             else globals()[m]
         )  # get module
+        t = m
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
@@ -1467,11 +1505,13 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, Detect_LSCD, Detect_TADDH, Detect_LADH, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+            if m in (Detect_LSCD, Detect_TADDH):
+                args[1] = make_divisible(min(args[1], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
@@ -1482,6 +1522,20 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
+        elif isinstance(m, str):
+            t = m
+            if len(args) == 2:        
+                m = timm.create_model(m, pretrained=args[0], pretrained_cfg_overlay={'file':args[1]}, features_only=True)
+            elif len(args) == 1:
+                m = timm.create_model(m, pretrained=args[0], features_only=True)
+            c2 = m.feature_info.channels()
+        elif m in {starnet_s050, starnet_s100, starnet_s150, starnet_s1, starnet_s2, starnet_s3, starnet_s4}:
+            m = m(*args)
+            c2 = m.channel
+        elif m in {EMA, CAA}:
+            c2 = ch[f]
+            args = [c2, *args]
+            # print(args)
         elif m in frozenset({TorchVision, Index}):
             c2 = args[0]
             c1 = ch[f]
@@ -1489,17 +1543,27 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         else:
             c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace("__main__.", "")  # module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        if isinstance(c2, list):
+            is_backbone = True
+            m_ = m
+            m_.backbone = True
+        else:
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+            t = str(m)[8:-2].replace('__main__.', '')  # module type
+        m.np = sum(x.numel() for x in m_.parameters())  # number params
+        m_.i, m_.f, m_.type = i + 4 if is_backbone else i, f, t  # attach index, 'from' index, type
         if verbose:
-            LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+            LOGGER.info(f'{i:>3}{str(f):>20}{n_:>3}{m.np:10.0f}  {t:<45}{str(args):<30}')  # print
+        save.extend(x % (i + 4 if is_backbone else i) for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []
-        ch.append(c2)
+        if isinstance(c2, list):
+            ch.extend(c2)
+            for _ in range(5 - len(ch)):
+                ch.insert(0, 0)
+        else:
+            ch.append(c2)
     return torch.nn.Sequential(*layers), sorted(save)
 
 
@@ -1589,7 +1653,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, WorldDetect, YOLOEDetect, v10Detect)):
+            elif isinstance(m, (Detect, Detect_LSCD, Detect_TADDH, Detect_LADH ,WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
     # Guess from model filename
