@@ -44,6 +44,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "C3k2",
+    "C3k2_Star",
     "C2fPSA",
     "C2PSA",
     "RepVGGDW",
@@ -1969,7 +1970,7 @@ class SAVPE(nn.Module):
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
 
 # TSTAR-MODIFICATION
-######################################## C2f-Star begin ########################################
+######################################## Star begin ########################################
 from timm.models.layers import DropPath
 
 class ConvBN(torch.nn.Sequential):
@@ -2092,5 +2093,51 @@ class C2f_Star_CAA(C2f):
         super().__init__(c1, c2, n, shortcut, g, e)
         self.m = nn.ModuleList(Star_Block_CAA(self.c) for _ in range(n))
 
-######################################## C2f-Star end ########################################
+
+class C3k2_Star(C2f):
+    """Faster Implementation of CSP Bottleneck with 2 convolutions."""
+
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=True):
+        """
+        Initialize C3k2 module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of blocks.
+            c3k (bool): Whether to use C3k blocks.
+            e (float): Expansion ratio.
+            g (int): Groups for convolutions.
+            shortcut (bool): Whether to use shortcut connections.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.m = nn.ModuleList(
+            C3k_Star(self.c, self.c, 2, shortcut, g) if c3k else StarNetBlock(self.c) for _ in range(n)
+        )
+
+
+
+class C3k_Star(C3):
+    """C3k is a CSP bottleneck module with customizable kernel sizes for feature extraction in neural networks."""
+
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
+        """
+        Initialize C3k module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of Bottleneck blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            g (int): Groups for convolutions.
+            e (float): Expansion ratio.
+            k (int): Kernel size.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        c_ = int(c2 * e)  # hidden channels
+        # self.m = nn.Sequential(*(RepBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
+        self.m = nn.Sequential(*(StarNetBlock(c_) for _ in range(n)))
+
+
+######################################## Star end ########################################
 
