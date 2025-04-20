@@ -45,4 +45,4 @@ head:
   - [[-1, 6], 1, Concat, [1]]  # 17 cat head P5
   - [-1, 2, C3k2_Star, [512, True]]  # 18 (P5/32-large)
 
-  - [[11, 14, 17], 1, Detect_TADDH, [nc, 512]]  # Detect(P3, P4, P5)
+  - [[12, 15, 18], 1, Detect_TADDH, [nc, 512]]  # Detect(P3, P4, P5)
