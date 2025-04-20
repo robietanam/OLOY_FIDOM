@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 
-model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-starnet-C2f-Star-LADH.yaml")  
+model = YOLO("ultralytics/cfg/models/11/modified/yolo11-Starnet-C2f-Star-LADH.yaml")  
 
 # Train the model
-results = model.info(verbose=True, detailed=False)
+results = model.info(verbose=True, detailed=True)
