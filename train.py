@@ -1,5 +1,5 @@
 from ultralytics import YOLO
 
-model = YOLO("ultralytics/cfg/models/11/modified/yolo11-Starnet-C3k2-Star.yaml")  
+model = YOLO("ultralytics/cfg/models/v8/yolov8.yaml")  
 # Train the model
 results = model.info(verbose=True, detailed=False)
