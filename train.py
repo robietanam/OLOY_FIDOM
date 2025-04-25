@@ -37,6 +37,12 @@ results = model.info(verbose=True, detailed=False)
 model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star.yaml")  
 results = model.info(verbose=True, detailed=False)
 
+model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star-CAA.yaml")  
+results = model.info(verbose=True, detailed=False)
+
+model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star-EMA.yaml")  
+results = model.info(verbose=True, detailed=False)
+
 model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-LSCD.yaml")  
 results = model.info(verbose=True, detailed=False)
 
@@ -49,9 +55,14 @@ results = model.info(verbose=True, detailed=False)
 model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-starnet-C2f-star-LADH.yaml")  
 results = model.info(verbose=True, detailed=False)
 
+model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star-CAA-LADH.yaml")  
+results = model.info(verbose=True, detailed=False)
+
+model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star-EMA-LADH.yaml")  
+results = model.info(verbose=True, detailed=False)
+
 model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star-LSCD.yaml")  
 results = model.info(verbose=True, detailed=False)
 
 model = YOLO("ultralytics/cfg/models/v8/modified/yolov8-C2f-star-LADH.yaml")  
 results = model.info(verbose=True, detailed=False)
-
