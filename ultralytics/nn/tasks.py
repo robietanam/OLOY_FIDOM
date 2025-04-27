@@ -77,7 +77,7 @@ from ultralytics.nn.modules import (
     v10Detect,
 )
 from ultralytics.nn.modules.starnet import *
-from ultralytics.nn.modules.block import CAA, EMA
+from ultralytics.nn.modules.block import CAA, EMA, Fusion
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -1455,20 +1455,31 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
-        m = (
-            getattr(torch.nn, m[3:])
-            if "nn." in m
-            else getattr(__import__("torchvision").ops, m[16:])
-            if "torchvision.ops." in m
-            else globals()[m]
-        )  # get module
-        t = m
+        try:
+            if m == 'node_mode':
+                m = d[m]
+                if len(args) > 0:
+                    if args[0] == 'head_channel':
+                        args[0] = int(d[args[0]])
+            t = m
+            m = getattr(torch.nn, m[3:]) if 'nn.' in m else globals()[m]  # get module
+        except:
+            m = (
+                getattr(torch.nn, m[3:])
+                if "nn." in m
+                else getattr(__import__("torchvision").ops, m[16:])
+                if "torchvision.ops." in m
+                else globals()[m]
+            )  # get module
+            t = m
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
+            if args[0] == 'head_channel':
+                args[0] = d[args[0]]
             c1, c2 = ch[f], args[0]
             if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
@@ -1516,6 +1527,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
             args.insert(1, [ch[x] for x in f])
+        elif m is Fusion:
+            args[0] = d[args[0]]
+            c1, c2 = [ch[x] for x in f], (sum([ch[x] for x in f]) if args[0] == 'concat' else ch[f[0]])
+            args = [c1, args[0]]
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]
