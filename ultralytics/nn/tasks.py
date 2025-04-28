@@ -1461,9 +1461,6 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 if len(args) > 0:
                     if args[0] == 'head_channel':
                         args[0] = int(d[args[0]])
-            t = m
-            m = getattr(torch.nn, m[3:]) if 'nn.' in m else globals()[m]  # get module
-        except:
             m = (
                 getattr(torch.nn, m[3:])
                 if "nn." in m
@@ -1472,6 +1469,8 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 else globals()[m]
             )  # get module
             t = m
+        except:
+            pass
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
