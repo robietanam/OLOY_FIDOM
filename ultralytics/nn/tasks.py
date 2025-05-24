@@ -76,8 +76,16 @@ from ultralytics.nn.modules import (
     YOLOEDetect,
     YOLOESegment,
     v10Detect,
+    CSPStage,
+    DySample,
+    ChannelAttention_HSFPN,
+    FocusFeature,
+    Multiply, 
+    Add,
+    Detect_AFPN_P345
 )
-from ultralytics.nn.modules.starnet import *
+from ultralytics.nn.modules.backbone.starnet import *
+from ultralytics.nn.modules.backbone.fasternet import *
 from ultralytics.nn.modules.block import CAA, EMA, Fusion
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -286,7 +294,7 @@ class BaseModel(torch.nn.Module):
         self = super()._apply(fn)
         m = self.model[-1]  # Detect()
         if isinstance(
-            m, (Detect, Detect_LADH, Detect_LSCD, Detect_TADDH)
+            m, (Detect, Detect_LADH, Detect_LSCD, Detect_AFPN_P345, Detect_TADDH)
         ):  # includes all Detect subclasses like Segment, Pose, OBB, WorldDetect, YOLOEDetect, YOLOESegment
             m.stride = fn(m.stride)
             m.anchors = fn(m.anchors)
@@ -361,7 +369,7 @@ class DetectionModel(BaseModel):
 
         # Build strides
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Detect_LADH, Detect_LSCD, Detect_TADDH)):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+        if isinstance(m, (Detect, Detect_LADH, Detect_LSCD, Detect_AFPN_P345, Detect_TADDH)):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
             s = 256  # 2x min stride TSTAR-MODIFICATION
             m.inplace = self.inplace
 
@@ -1432,6 +1440,9 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             SCDown,
             C2fCIB,
             A2C2f,
+            CSPStage,
+            nn.Conv2d,
+            
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -1454,6 +1465,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             C2PSA,
             A2C2f,
+            CSPStage
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -1517,7 +1529,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in frozenset(
-            {Detect, Detect_LSCD, Detect_TADDH, Detect_LADH, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
+            {Detect, Detect_LSCD, Detect_AFPN_P345, Detect_TADDH, Detect_LADH, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
         ):
             args.append([ch[x] for x in f])
             if m is Segment or m is YOLOESegment:
@@ -1542,13 +1554,22 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             t = m
             m = timm.create_model(m, pretrained=args[0], features_only=True)
             c2 = m.feature_info.channels()
-        elif m in {starnet_s050, starnet_s100, starnet_s150, starnet_s1, starnet_s2, starnet_s3, starnet_s4}:
+        elif m in {starnet_s050, starnet_s100, starnet_s150, starnet_s1, starnet_s2, starnet_s3, starnet_s4,
+                   fasternet_t0, fasternet_t1, fasternet_t2, fasternet_s, fasternet_m, fasternet_l}:
             m = m(*args)
             c2 = m.channel
-        elif m in {EMA, CAA}:
+        elif m in {EMA, CAA, Partial_conv3, DySample, ChannelAttention_HSFPN}:
             c2 = ch[f]
             args = [c2, *args]
             # print(args)
+        elif m is Add:
+            c2 = ch[f[-1]]
+        elif m is Multiply:
+            c2 = ch[f[0]]
+        elif m is FocusFeature:
+            c1 = [ch[x] for x in f]
+            c2 = int(c1[1] * 0.5 * 3)
+            args = [c1, *args]
         elif m in frozenset({TorchVision, Index}):
             c2 = args[0]
             c1 = ch[f]
@@ -1666,7 +1687,7 @@ def guess_model_task(model):
                 return "pose"
             elif isinstance(m, OBB):
                 return "obb"
-            elif isinstance(m, (Detect, Detect_LSCD, Detect_TADDH, Detect_LADH ,WorldDetect, YOLOEDetect, v10Detect)):
+            elif isinstance(m, (Detect, Detect_LSCD, Detect_AFPN_P345, Detect_TADDH, Detect_LADH ,WorldDetect, YOLOEDetect, v10Detect)):
                 return "detect"
 
     # Guess from model filename

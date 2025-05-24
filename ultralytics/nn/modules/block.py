@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """Block modules."""
-
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -54,6 +54,12 @@ __all__ = (
     "PSA",
     "SCDown",
     "TorchVision",
+    "CSPStage",
+    "DySample",
+    "FocusFeature",
+    "Detect_AFPN_P345",
+    "Multiply",
+    "Add",
 )
 
 
@@ -2201,6 +2207,47 @@ class Fusion(nn.Module):
             return torch.sum(torch.stack([fusion_weight[i] * x[i] for i in range(len(x))], dim=0), dim=0)
         elif self.fusion == 'SDI':
             return self.SDI(x)
+        
+
+class FusionMish(nn.Module):
+    def __init__(self, inc_list, fusion='bifpn') -> None:
+        super().__init__()
+        
+        assert fusion in ['weight', 'adaptive', 'concat', 'bifpn', 'SDI']
+        self.fusion = fusion
+        
+        if self.fusion == 'bifpn':
+            self.fusion_weight = nn.Parameter(torch.ones(len(inc_list), dtype=torch.float32), requires_grad=True)
+            self.act = nn.Mish()
+            self.epsilon = 1e-4
+        elif self.fusion == 'SDI':
+            self.SDI = SDI(inc_list)
+        else:
+            self.fusion_conv = nn.ModuleList([Conv(inc, inc, 1) for inc in inc_list])
+
+            if self.fusion == 'adaptive':
+                self.fusion_adaptive = Conv(sum(inc_list), len(inc_list), 1)
+        
+    
+    def forward(self, x):
+        if self.fusion in ['weight', 'adaptive']:
+            for i in range(len(x)):
+                x[i] = self.fusion_conv[i](x[i])
+        if self.fusion == 'weight':
+            return torch.sum(torch.stack(x, dim=0), dim=0)
+        elif self.fusion == 'adaptive':
+            fusion = torch.softmax(self.fusion_adaptive(torch.cat(x, dim=1)), dim=1)
+            x_weight = torch.split(fusion, [1] * len(x), dim=1)
+            return torch.sum(torch.stack([x_weight[i] * x[i] for i in range(len(x))], dim=0), dim=0)
+        elif self.fusion == 'concat':
+            return torch.cat(x, dim=1)
+        elif self.fusion == 'bifpn':
+            fusion_weight = self.act(self.fusion_weight.clone())
+            fusion_weight = fusion_weight / (torch.sum(fusion_weight, dim=0))
+            return torch.sum(torch.stack([fusion_weight[i] * x[i] for i in range(len(x))], dim=0), dim=0)
+        elif self.fusion == 'SDI':
+            return self.SDI(x)
+
 
 ######################################## BIFPN end ########################################
 
@@ -2250,3 +2297,630 @@ class SDI(nn.Module):
         return ans
 
 ######################################## Semantics and Detail Infusion end ########################################
+
+
+######################################## DAMO-YOLO GFPN start ########################################
+
+class BasicBlock_3x3_Reverse(nn.Module):
+    def __init__(self,
+                 ch_in,
+                 ch_hidden_ratio,
+                 ch_out,
+                 shortcut=True):
+        super(BasicBlock_3x3_Reverse, self).__init__()
+        assert ch_in == ch_out
+        ch_hidden = int(ch_in * ch_hidden_ratio)
+        self.conv1 = Conv(ch_hidden, ch_out, 3, s=1)
+        self.conv2 = RepConv(ch_in, ch_hidden, 3, s=1)
+        self.shortcut = shortcut
+
+    def forward(self, x):
+        y = self.conv2(x)
+        y = self.conv1(y)
+        if self.shortcut:
+            return x + y
+        else:
+            return y
+
+class SPP_MODULE(nn.Module):
+    def __init__(
+        self,
+        ch_in,
+        ch_out,
+        k,
+        pool_size
+    ):
+        super(SPP_MODULE, self).__init__()
+        self.pool = []
+        for i, size in enumerate(pool_size):
+            pool = nn.MaxPool2d(kernel_size=size,
+                                stride=1,
+                                padding=size // 2,
+                                ceil_mode=False)
+            self.add_module('pool{}'.format(i), pool)
+            self.pool.append(pool)
+        self.conv = Conv(ch_in, ch_out, k)
+
+    def forward(self, x):
+        outs = [x]
+
+        for pool in self.pool:
+            outs.append(pool(x))
+        y = torch.cat(outs, axis=1)
+
+        y = self.conv(y)
+        return y
+
+class CSPStage(nn.Module):
+    def __init__(self,
+                 ch_in,
+                 ch_out,
+                 n,
+                 block_fn='BasicBlock_3x3_Reverse',
+                 ch_hidden_ratio=1.0,
+                 act='silu',
+                 spp=False):
+        super(CSPStage, self).__init__()
+
+        split_ratio = 2
+        ch_first = int(ch_out // split_ratio)
+        ch_mid = int(ch_out - ch_first)
+        self.conv1 = Conv(ch_in, ch_first, 1)
+        self.conv2 = Conv(ch_in, ch_mid, 1)
+        self.convs = nn.Sequential()
+
+        next_ch_in = ch_mid
+        for i in range(n):
+            if block_fn == 'BasicBlock_3x3_Reverse':
+                self.convs.add_module(
+                    str(i),
+                    BasicBlock_3x3_Reverse(next_ch_in,
+                                           ch_hidden_ratio,
+                                           ch_mid,
+                                           shortcut=True))
+            else:
+                raise NotImplementedError
+            if i == (n - 1) // 2 and spp:
+                self.convs.add_module('spp', SPP_MODULE(ch_mid * 4, ch_mid, 1, [5, 9, 13]))
+            next_ch_in = ch_mid
+        self.conv3 = Conv(ch_mid * n + ch_first, ch_out, 1)
+
+    def forward(self, x):
+        y1 = self.conv1(x)
+        y2 = self.conv2(x)
+
+        mid_out = [y1]
+        for conv in self.convs:
+            y2 = conv(y2)
+            mid_out.append(y2)
+        y = torch.cat(mid_out, axis=1)
+        y = self.conv3(y)
+        return y
+
+######################################## DAMO-YOLO GFPN end ########################################
+
+######################################## DySample start ########################################
+
+class DySample(nn.Module):
+    def __init__(self, in_channels, scale=2, style='lp', groups=4, dyscope=False):
+        super().__init__()
+        self.scale = scale
+        self.style = style
+        self.groups = groups
+        assert style in ['lp', 'pl']
+        if style == 'pl':
+            assert in_channels >= scale ** 2 and in_channels % scale ** 2 == 0
+        assert in_channels >= groups and in_channels % groups == 0
+
+        if style == 'pl':
+            in_channels = in_channels // scale ** 2
+            out_channels = 2 * groups
+        else:
+            out_channels = 2 * groups * scale ** 2
+
+        self.offset = nn.Conv2d(in_channels, out_channels, 1)
+        self.normal_init(self.offset, std=0.001)
+        if dyscope:
+            self.scope = nn.Conv2d(in_channels, out_channels, 1)
+            self.constant_init(self.scope, val=0.)
+
+        self.register_buffer('init_pos', self._init_pos())
+
+    def normal_init(self, module, mean=0, std=1, bias=0):
+        if hasattr(module, 'weight') and module.weight is not None:
+            nn.init.normal_(module.weight, mean, std)
+        if hasattr(module, 'bias') and module.bias is not None:
+            nn.init.constant_(module.bias, bias)
+
+    def constant_init(self, module, val, bias=0):
+        if hasattr(module, 'weight') and module.weight is not None:
+            nn.init.constant_(module.weight, val)
+        if hasattr(module, 'bias') and module.bias is not None:
+            nn.init.constant_(module.bias, bias)
+
+    def _init_pos(self):
+        h = torch.arange((-self.scale + 1) / 2, (self.scale - 1) / 2 + 1) / self.scale
+        return torch.stack(torch.meshgrid([h, h])).transpose(1, 2).repeat(1, self.groups, 1).reshape(1, -1, 1, 1)
+
+    def sample(self, x, offset):
+        B, _, H, W = offset.shape
+        offset = offset.view(B, 2, -1, H, W)
+        coords_h = torch.arange(H) + 0.5
+        coords_w = torch.arange(W) + 0.5
+        coords = torch.stack(torch.meshgrid([coords_w, coords_h])
+                             ).transpose(1, 2).unsqueeze(1).unsqueeze(0).type(x.dtype).to(x.device)
+        normalizer = torch.tensor([W, H], dtype=x.dtype, device=x.device).view(1, 2, 1, 1, 1)
+        coords = 2 * (coords + offset) / normalizer - 1
+        coords = F.pixel_shuffle(coords.view(B, -1, H, W), self.scale).view(
+            B, 2, -1, self.scale * H, self.scale * W).permute(0, 2, 3, 4, 1).contiguous().flatten(0, 1)
+        return F.grid_sample(x.reshape(B * self.groups, -1, H, W), coords, mode='bilinear',
+                             align_corners=False, padding_mode="border").reshape((B, -1, self.scale * H, self.scale * W))
+
+    def forward_lp(self, x):
+        if hasattr(self, 'scope'):
+            offset = self.offset(x) * self.scope(x).sigmoid() * 0.5 + self.init_pos
+        else:
+            offset = self.offset(x) * 0.25 + self.init_pos
+        return self.sample(x, offset)
+
+    def forward_pl(self, x):
+        x_ = F.pixel_shuffle(x, self.scale)
+        if hasattr(self, 'scope'):
+            offset = F.pixel_unshuffle(self.offset(x_) * self.scope(x_).sigmoid(), self.scale) * 0.5 + self.init_pos
+        else:
+            offset = F.pixel_unshuffle(self.offset(x_), self.scale) * 0.25 + self.init_pos
+        return self.sample(x, offset)
+
+    def forward(self, x):
+        if self.style == 'pl':
+            return self.forward_pl(x)
+        return self.forward_lp(x)
+
+######################################## DySample end ########################################
+
+######################################## Focus Diffusion Pyramid Network end ########################################
+
+class FocusFeature(nn.Module):
+    def __init__(self, inc, kernel_sizes=(5, 7, 9, 11), e=0.5) -> None:
+        super().__init__()
+        hidc = int(inc[1] * e)
+        
+        self.conv1 = nn.Sequential(
+            nn.Upsample(scale_factor=2),
+            Conv(inc[0], hidc, 1)
+        )
+        self.conv2 = Conv(inc[1], hidc, 1) if e != 1 else nn.Identity()
+        self.conv3 = ADown(inc[2], hidc)
+        
+        
+        self.dw_conv = nn.ModuleList(nn.Conv2d(hidc * 3, hidc * 3, kernel_size=k, padding=autopad(k), groups=hidc * 3) for k in kernel_sizes)
+        self.pw_conv = Conv(hidc * 3, hidc * 3)
+    
+    def forward(self, x):
+        x1, x2, x3 = x
+        x1 = self.conv1(x1)
+        x2 = self.conv2(x2)
+        x3 = self.conv3(x3)
+        
+        x = torch.cat([x1, x2, x3], dim=1)
+        feature = torch.sum(torch.stack([x] + [layer(x) for layer in self.dw_conv], dim=0), dim=0)
+        feature = self.pw_conv(feature)
+        
+        x = x + feature
+        return x
+        
+######################################## Focus Diffusion Pyramid Network end ########################################
+   
+def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
+    """Transform distance(ltrb) to box(xywh or xyxy)."""
+    lt, rb = distance.chunk(2, dim)
+    x1y1 = anchor_points - lt
+    x2y2 = anchor_points + rb
+    if xywh:
+        c_xy = (x1y1 + x2y2) / 2
+        wh = x2y2 - x1y1
+        return torch.cat((c_xy, wh), dim)  # xywh bbox
+    return torch.cat((x1y1, x2y2), dim)  # xyxy bbox
+
+
+def make_anchors(feats, strides, grid_cell_offset=0.5):
+    """Generate anchors from features."""
+    anchor_points, stride_tensor = [], []
+    assert feats is not None
+    dtype, device = feats[0].dtype, feats[0].device
+    for i, stride in enumerate(strides):
+        _, _, h, w = feats[i].shape
+        sx = torch.arange(end=w, device=device, dtype=dtype) + grid_cell_offset  # shift x
+        sy = torch.arange(end=h, device=device, dtype=dtype) + grid_cell_offset  # shift y
+        sy, sx = torch.meshgrid(sy, sx, indexing="ij") if TORCH_1_10 else torch.meshgrid(sy, sx)
+        anchor_points.append(torch.stack((sx, sy), -1).view(-1, 2))
+        stride_tensor.append(torch.full((h * w, 1), stride, dtype=dtype, device=device))
+    return torch.cat(anchor_points), torch.cat(stride_tensor)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, filter_in, filter_out):
+        super(BasicBlock, self).__init__()
+        self.conv1 = Conv(filter_in, filter_out, 3)
+        self.conv2 = Conv(filter_out, filter_out, 3, act=False)
+
+    def forward(self, x):
+        residual = x
+
+        out = self.conv1(x)
+        out = self.conv2(out)
+
+        out += residual
+        return self.conv1.act(out)
+
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels, out_channels, scale_factor=2):
+        super(Upsample, self).__init__()
+
+        self.upsample = nn.Sequential(
+            Conv(in_channels, out_channels, 1),
+            nn.Upsample(scale_factor=scale_factor, mode='bilinear')
+        )
+
+    def forward(self, x):
+        x = self.upsample(x)
+        return x
+
+
+class Downsample_x2(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Downsample_x2, self).__init__()
+
+        self.downsample = Conv(in_channels, out_channels, 2, 2, 0)
+
+    def forward(self, x):
+        x = self.downsample(x)
+        return x
+
+
+class Downsample_x4(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Downsample_x4, self).__init__()
+
+        self.downsample = Conv(in_channels, out_channels, 4, 4, 0)
+
+    def forward(self, x):
+        x = self.downsample(x)
+        return x
+
+
+class Downsample_x8(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Downsample_x8, self).__init__()
+
+        self.downsample = Conv(in_channels, out_channels, 8, 8, 0)
+
+    def forward(self, x):
+        x = self.downsample(x)
+        return x
+
+class ASFF_2(nn.Module):
+    def __init__(self, inter_dim=512):
+        super(ASFF_2, self).__init__()
+
+        self.inter_dim = inter_dim
+        compress_c = 8
+
+        self.weight_level_1 = Conv(self.inter_dim, compress_c, 1)
+        self.weight_level_2 = Conv(self.inter_dim, compress_c, 1)
+
+        self.weight_levels = nn.Conv2d(compress_c * 2, 2, kernel_size=1, stride=1, padding=0)
+
+        self.conv = Conv(self.inter_dim, self.inter_dim, 3)
+
+    def forward(self, input1, input2):
+        level_1_weight_v = self.weight_level_1(input1)
+        level_2_weight_v = self.weight_level_2(input2)
+
+        levels_weight_v = torch.cat((level_1_weight_v, level_2_weight_v), 1)
+        levels_weight = self.weight_levels(levels_weight_v)
+        levels_weight = F.softmax(levels_weight, dim=1)
+
+        fused_out_reduced = input1 * levels_weight[:, 0:1, :, :] + \
+                            input2 * levels_weight[:, 1:2, :, :]
+
+        out = self.conv(fused_out_reduced)
+        return out
+
+
+class ASFF_3(nn.Module):
+    def __init__(self, inter_dim=512):
+        super(ASFF_3, self).__init__()
+
+        self.inter_dim = inter_dim
+        compress_c = 8
+
+        self.weight_level_1 = Conv(self.inter_dim, compress_c, 1)
+        self.weight_level_2 = Conv(self.inter_dim, compress_c, 1)
+        self.weight_level_3 = Conv(self.inter_dim, compress_c, 1)
+
+        self.weight_levels = nn.Conv2d(compress_c * 3, 3, kernel_size=1, stride=1, padding=0)
+
+        self.conv = Conv(self.inter_dim, self.inter_dim, 3)
+
+    def forward(self, input1, input2, input3):
+        level_1_weight_v = self.weight_level_1(input1)
+        level_2_weight_v = self.weight_level_2(input2)
+        level_3_weight_v = self.weight_level_3(input3)
+
+        levels_weight_v = torch.cat((level_1_weight_v, level_2_weight_v, level_3_weight_v), 1)
+        levels_weight = self.weight_levels(levels_weight_v)
+        levels_weight = F.softmax(levels_weight, dim=1)
+
+        fused_out_reduced = input1 * levels_weight[:, 0:1, :, :] + \
+                            input2 * levels_weight[:, 1:2, :, :] + \
+                            input3 * levels_weight[:, 2:, :, :]
+
+        out = self.conv(fused_out_reduced)
+        return out
+
+
+class ASFF_4(nn.Module):
+    def __init__(self, inter_dim=512):
+        super(ASFF_4, self).__init__()
+
+        self.inter_dim = inter_dim
+        compress_c = 8
+
+        self.weight_level_0 = Conv(self.inter_dim, compress_c, 1)
+        self.weight_level_1 = Conv(self.inter_dim, compress_c, 1)
+        self.weight_level_2 = Conv(self.inter_dim, compress_c, 1)
+        self.weight_level_3 = Conv(self.inter_dim, compress_c, 1)
+
+        self.weight_levels = nn.Conv2d(compress_c * 4, 4, kernel_size=1, stride=1, padding=0)
+
+        self.conv = Conv(self.inter_dim, self.inter_dim, 3)
+
+    def forward(self, input0, input1, input2, input3):
+        level_0_weight_v = self.weight_level_0(input0)
+        level_1_weight_v = self.weight_level_1(input1)
+        level_2_weight_v = self.weight_level_2(input2)
+        level_3_weight_v = self.weight_level_3(input3)
+
+        levels_weight_v = torch.cat((level_0_weight_v, level_1_weight_v, level_2_weight_v, level_3_weight_v), 1)
+        levels_weight = self.weight_levels(levels_weight_v)
+        levels_weight = F.softmax(levels_weight, dim=1)
+
+        fused_out_reduced = input0 * levels_weight[:, 0:1, :, :] + \
+                            input1 * levels_weight[:, 1:2, :, :] + \
+                            input2 * levels_weight[:, 2:3, :, :] + \
+                            input3 * levels_weight[:, 3:, :, :]
+
+        out = self.conv(fused_out_reduced)
+
+        return out
+
+
+class BlockBody_P345(nn.Module):
+    def __init__(self, channels=[64, 128, 256, 512]):
+        super(BlockBody_P345, self).__init__()
+
+        self.blocks_scalezero1 = nn.Sequential(
+            Conv(channels[0], channels[0], 1),
+        )
+        self.blocks_scaleone1 = nn.Sequential(
+            Conv(channels[1], channels[1], 1),
+        )
+        self.blocks_scaletwo1 = nn.Sequential(
+            Conv(channels[2], channels[2], 1),
+        )
+        
+        self.downsample_scalezero1_2 = Downsample_x2(channels[0], channels[1])
+        self.upsample_scaleone1_2 = Upsample(channels[1], channels[0], scale_factor=2)
+
+        self.asff_scalezero1 = ASFF_2(inter_dim=channels[0])
+        self.asff_scaleone1 = ASFF_2(inter_dim=channels[1])
+
+        self.blocks_scalezero2 = nn.Sequential(
+            BasicBlock(channels[0], channels[0]),
+            BasicBlock(channels[0], channels[0]),
+            BasicBlock(channels[0], channels[0]),
+            BasicBlock(channels[0], channels[0]),
+        )
+        self.blocks_scaleone2 = nn.Sequential(
+            BasicBlock(channels[1], channels[1]),
+            BasicBlock(channels[1], channels[1]),
+            BasicBlock(channels[1], channels[1]),
+            BasicBlock(channels[1], channels[1]),
+        )
+
+        self.downsample_scalezero2_2 = Downsample_x2(channels[0], channels[1])
+        self.downsample_scalezero2_4 = Downsample_x4(channels[0], channels[2])
+        self.downsample_scaleone2_2 = Downsample_x2(channels[1], channels[2])
+        self.upsample_scaleone2_2 = Upsample(channels[1], channels[0], scale_factor=2)
+        self.upsample_scaletwo2_2 = Upsample(channels[2], channels[1], scale_factor=2)
+        self.upsample_scaletwo2_4 = Upsample(channels[2], channels[0], scale_factor=4)
+
+        self.asff_scalezero2 = ASFF_3(inter_dim=channels[0])
+        self.asff_scaleone2 = ASFF_3(inter_dim=channels[1])
+        self.asff_scaletwo2 = ASFF_3(inter_dim=channels[2])
+
+        self.blocks_scalezero3 = nn.Sequential(
+            BasicBlock(channels[0], channels[0]),
+            BasicBlock(channels[0], channels[0]),
+            BasicBlock(channels[0], channels[0]),
+            BasicBlock(channels[0], channels[0]),
+        )
+        self.blocks_scaleone3 = nn.Sequential(
+            BasicBlock(channels[1], channels[1]),
+            BasicBlock(channels[1], channels[1]),
+            BasicBlock(channels[1], channels[1]),
+            BasicBlock(channels[1], channels[1]),
+        )
+        self.blocks_scaletwo3 = nn.Sequential(
+            BasicBlock(channels[2], channels[2]),
+            BasicBlock(channels[2], channels[2]),
+            BasicBlock(channels[2], channels[2]),
+            BasicBlock(channels[2], channels[2]),
+        )
+
+        self.downsample_scalezero3_2 = Downsample_x2(channels[0], channels[1])
+        self.downsample_scalezero3_4 = Downsample_x4(channels[0], channels[2])
+        self.upsample_scaleone3_2 = Upsample(channels[1], channels[0], scale_factor=2)
+        self.downsample_scaleone3_2 = Downsample_x2(channels[1], channels[2])
+        self.upsample_scaletwo3_4 = Upsample(channels[2], channels[0], scale_factor=4)
+        self.upsample_scaletwo3_2 = Upsample(channels[2], channels[1], scale_factor=2)
+
+    def forward(self, x):
+        x0, x1, x2 = x
+
+        x0 = self.blocks_scalezero1(x0)
+        x1 = self.blocks_scaleone1(x1)
+        x2 = self.blocks_scaletwo1(x2)
+
+        scalezero = self.asff_scalezero1(x0, self.upsample_scaleone1_2(x1))
+        scaleone = self.asff_scaleone1(self.downsample_scalezero1_2(x0), x1)
+
+        x0 = self.blocks_scalezero2(scalezero)
+        x1 = self.blocks_scaleone2(scaleone)
+
+        scalezero = self.asff_scalezero2(x0, self.upsample_scaleone2_2(x1), self.upsample_scaletwo2_4(x2))
+        scaleone = self.asff_scaleone2(self.downsample_scalezero2_2(x0), x1, self.upsample_scaletwo2_2(x2))
+        scaletwo = self.asff_scaletwo2(self.downsample_scalezero2_4(x0), self.downsample_scaleone2_2(x1), x2)
+
+        x0 = self.blocks_scalezero3(scalezero)
+        x1 = self.blocks_scaleone3(scaleone)
+        x2 = self.blocks_scaletwo3(scaletwo)
+
+        return x0, x1, x2
+
+class AFPN_P345(nn.Module):
+    def __init__(self,
+                 in_channels=[256, 512, 1024],
+                 out_channels=256,
+                 factor=4):
+        super(AFPN_P345, self).__init__()
+
+        self.conv0 = Conv(in_channels[0], in_channels[0] // factor, 1)
+        self.conv1 = Conv(in_channels[1], in_channels[1] // factor, 1)
+        self.conv2 = Conv(in_channels[2], in_channels[2] // factor, 1)
+
+        self.body = nn.Sequential(
+            BlockBody_P345([in_channels[0] // factor, in_channels[1] // factor, in_channels[2] // factor])
+        )
+
+        self.conv00 = Conv(in_channels[0] // factor, out_channels, 1)
+        self.conv11 = Conv(in_channels[1] // factor, out_channels, 1)
+        self.conv22 = Conv(in_channels[2] // factor, out_channels, 1)
+
+        # init weight
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_normal_(m.weight, gain=0.02)
+            elif isinstance(m, nn.BatchNorm2d):
+                torch.nn.init.normal_(m.weight.data, 1.0, 0.02)
+                torch.nn.init.constant_(m.bias.data, 0.0)
+
+    def forward(self, x):
+        x0, x1, x2 = x
+
+        x0 = self.conv0(x0)
+        x1 = self.conv1(x1)
+        x2 = self.conv2(x2)
+
+        out0, out1, out2 = self.body([x0, x1, x2])
+
+        out0 = self.conv00(out0)
+        out1 = self.conv11(out1)
+        out2 = self.conv22(out2)
+        return [out0, out1, out2]
+
+
+class Detect_AFPN_P345(nn.Module):
+    """YOLOv8 Detect head with AFPN for detection models."""
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, hidc=256, ch=()):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch)  # number of detection layers
+        self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], self.nc)  # channels
+        self.afpn = AFPN_P345(ch, hidc)
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(hidc, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for _ in ch)
+        self.cv3 = nn.ModuleList(nn.Sequential(Conv(hidc, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for _ in ch)
+        self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
+
+    def forward(self, x):
+        """Concatenates and returns predicted bounding boxes and class probabilities."""
+        x = self.afpn(x)
+        shape = x[0].shape  # BCHW
+        for i in range(self.nl):
+            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+        if self.training:
+            return x
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (x.transpose(0, 1) for x in make_anchors(x, self.stride, 0.5))
+            self.shape = shape
+
+        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
+        if self.export and self.format in ('saved_model', 'pb', 'tflite', 'edgetpu', 'tfjs'):  # avoid TF FlexSplitV ops
+            box = x_cat[:, :self.reg_max * 4]
+            cls = x_cat[:, self.reg_max * 4:]
+        else:
+            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+        dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+        y = torch.cat((dbox, cls.sigmoid()), 1)
+        return y if self.export else (y, x)
+
+    def bias_init(self):
+        """Initialize Detect() biases, WARNING: requires stride availability."""
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+
+######################################## HS-FPN start ########################################
+
+class ChannelAttention_HSFPN(nn.Module):
+    def __init__(self, in_planes, ratio = 4, flag=True):
+        super(ChannelAttention_HSFPN, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.conv1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.flag = flag
+        self.sigmoid = nn.Sigmoid()
+
+        nn.init.xavier_uniform_(self.conv1.weight)
+        nn.init.xavier_uniform_(self.conv2.weight)
+
+    def forward(self, x):
+        avg_out = self.conv2(self.relu(self.conv1(self.avg_pool(x))))
+        max_out = self.conv2(self.relu(self.conv1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out) * x if self.flag else self.sigmoid(out)
+
+class Multiply(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def forward(self, x):
+        return x[0] * x[1]
+
+class Add(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return torch.sum(torch.stack(x, dim=0), dim=0)
+    

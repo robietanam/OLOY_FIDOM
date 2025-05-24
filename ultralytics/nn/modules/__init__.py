@@ -62,6 +62,14 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    CSPStage,
+    DySample,
+    ChannelAttention_HSFPN,
+    FocusFeature,
+    Multiply, 
+    Add,
+    Detect_AFPN_P345
+
 )
 from .conv import (
     CBAM,
